@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # === База Данных (PostgreSQL) ===
+  db:
+    image: postgres:15-alpine
+    container_name: tender_db
+    environment:
+      POSTGRES_USER: tender_user
+      POSTGRES_PASSWORD: tender_password
+      POSTGRES_DB: tender_bot_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+
+  # === Брокер сообщений (Redis) ===
+  redis:
+    image: redis:7-alpine
+    container_name: tender_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # === Микросервис Парсера (Воркер) ===
+  parser:
+    build: ./parser
+    container_name: tender_parser_worker
+    depends_on: [db, redis]
+    environment:
+      - DB_HOST=db
+      - DB_USER=tender_user
+      - DB_PASS=tender_password
+      - DB_NAME=tender_bot_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # === Планировщик задач (Celery Beat) ===
+  parser-beat:
+    build: ./parser
+    container_name: tender_parser_beat
+    depends_on: [redis]
+    command: celery -A tasks beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    restart: unless-stopped
+
+  # === Микросервис ИИ-Агент ===
+  ai_agent:
+    build: ./ai_agent
+    container_name: tender_ai_agent
+    depends_on: [db, redis]
+    environment:
+      - DB_HOST=db
+      - DB_USER=tender_user
+      - DB_PASS=tender_password
+      - DB_NAME=tender_bot_db
+      - REDIS_URL=redis://redis:6379/0
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # === Микросервис Telegram Бот ===
+  tg_bot:
+    build: ./bot
+    container_name: tender_tg_bot
+    depends_on: [db, redis]
+    environment:
+      - DB_HOST=db
+      - DB_USER=tender_user
+      - DB_PASS=tender_password
+      - DB_NAME=tender_bot_db
+      - REDIS_URL=redis://redis:6379/0
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL}
+      - ADMIN_TG_ID=${ADMIN_TG_ID}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
