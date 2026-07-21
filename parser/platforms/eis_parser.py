@@ -69,8 +69,22 @@ def parse_date(value: str | None) -> datetime | None:
 
 
 def safe_filename(name: str) -> str:
-    name = clean_text(name) or "document"
+    name = clean_text(_repair_mojibake(name)) or "document"
     return re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)[:180]
+
+
+def _repair_mojibake(value: str | None) -> str:
+    """Restores UTF-8 names that EIS exposes as a Latin-1 header value."""
+    name = value or ""
+    if not any(marker in name for marker in ("Ð", "Ñ", "Â", "Ã", "â")):
+        return name
+
+    try:
+        decoded = name.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
+    return decoded if decoded else name
 
 
 class EisParser(BaseTenderParser):
