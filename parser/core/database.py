@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, String, Numeric, DateTime, Date, ForeignKey, Integer
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from datetime import datetime, timezone
 from core.base_parser import TenderCard
 
@@ -55,28 +55,80 @@ class TenderDocumentDB(Base):
     downloaded_at = Column(DateTime(timezone=True))
 
 
+async def get_tender_by_reestr(session: AsyncSession, reestr_number: str) -> TenderDB | None:
+    result = await session.execute(select(TenderDB).where(TenderDB.reestr_number == reestr_number))
+    return result.scalars().first()
+
+
+async def tender_has_documents(session: AsyncSession, tender_id) -> bool:
+    result = await session.execute(
+        select(TenderDocumentDB.id).where(TenderDocumentDB.tender_id == tender_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def get_expired_tenders_with_documents(session: AsyncSession) -> list[TenderDB]:
+    """Тендеры, у которых срок подачи уже прошёл, а файлы ещё хранятся."""
+    stmt = (
+        select(TenderDB)
+        .join(TenderDocumentDB, TenderDocumentDB.tender_id == TenderDB.id)
+        .where(TenderDB.submission_deadline < datetime.now(timezone.utc))
+        .distinct()
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_tenders_with_documents(session: AsyncSession, limit: int) -> list[TenderDB]:
+    """Активные записи для проверки, не закрылась ли закупка раньше дедлайна."""
+    stmt = (
+        select(TenderDB)
+        .join(TenderDocumentDB, TenderDocumentDB.tender_id == TenderDB.id)
+        .where(TenderDB.submission_deadline >= datetime.now(timezone.utc))
+        .order_by(TenderDB.last_updated_at.asc())
+        .limit(limit)
+        .distinct()
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def delete_tender_documents(session: AsyncSession, tender_id) -> None:
+    await session.execute(delete(TenderDocumentDB).where(TenderDocumentDB.tender_id == tender_id))
+    await session.commit()
 
 
 
-async def save_or_update_tender(session: AsyncSession, tender: TenderCard) -> tuple[str, bool]:
+
+
+async def save_or_update_tender(session: AsyncSession, tender: TenderCard) -> tuple[str, bool, bool, bool]:
     """
     Сохраняет тендер и его документы.
-    Возвращает (ID тендера в формате UUID, Флаг: был ли это уже существующий тендер).
+    Возвращает (UUID, существовал ли, изменился ли статус площадки, изменился ли дедлайн).
     """
     # 1. Проверяем, существует ли тендер по реестровому номеру
-    stmt = select(TenderDB).where(TenderDB.reestr_number == tender.tender_id)
-    result = await session.execute(stmt)
-    existing_tender = result.scalars().first()
+    existing_tender = await get_tender_by_reestr(session, tender.tender_id)
 
     is_existing = existing_tender is not None
 
     if is_existing:
+        status_changed = existing_tender.status_on_platform != tender.status
+        deadline_changed = existing_tender.submission_deadline != tender.deadline
+
         # Обновляем только то, что могло измениться
         existing_tender.status_on_platform = tender.status
         existing_tender.submission_deadline = tender.deadline
+        existing_tender.title = tender.title
+        existing_tender.customer_name = tender.customer_name
+        existing_tender.customer_inn = tender.customer_inn
+        existing_tender.nmck = tender.price
+        existing_tender.region = tender.region
+        existing_tender.source_url = tender.url
         existing_tender.last_updated_at = datetime.now(timezone.utc)
         db_tender_id = existing_tender.id
     else:
+        status_changed = False
+        deadline_changed = False
         # Создаем новую запись
         new_tender = TenderDB(
             reestr_number=tender.tender_id,
@@ -122,4 +174,4 @@ async def save_or_update_tender(session: AsyncSession, tender: TenderCard) -> tu
     await session.commit()
 
     # Возвращаем строковое представление UUID для Celery
-    return str(db_tender_id), is_existing
+    return str(db_tender_id), is_existing, status_changed, deadline_changed

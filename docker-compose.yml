@@ -1,16 +1,14 @@
-version: '3.8'
-
 services:
   # === База Данных (PostgreSQL) ===
   db:
     image: postgres:15-alpine
     container_name: tender_db
     environment:
-      POSTGRES_USER: tender_user
-      POSTGRES_PASSWORD: tender_password
-      POSTGRES_DB: tender_bot_db
+      POSTGRES_USER: ${DB_USER:-tender_user}
+      POSTGRES_PASSWORD: ${DB_PASS:-tender_password}
+      POSTGRES_DB: ${DB_NAME:-tender_bot_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -21,7 +19,7 @@ services:
     image: redis:7-alpine
     container_name: tender_redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     restart: unless-stopped
 
   # === Микросервис Парсера (Воркер) ===
@@ -31,12 +29,13 @@ services:
     depends_on: [db, redis]
     environment:
       - DB_HOST=db
-      - DB_USER=tender_user
-      - DB_PASS=tender_password
-      - DB_NAME=tender_bot_db
+      - DB_USER=${DB_USER:-tender_user}
+      - DB_PASS=${DB_PASS:-tender_password}
+      - DB_NAME=${DB_NAME:-tender_bot_db}
       - REDIS_URL=redis://redis:6379/0
     volumes:
-      - ./data:/app/data
+      - ./data/tenders:/data/tenders
+      - ./parser/search_profiles.json:/app/search_profiles.json:ro
     restart: unless-stopped
 
   # === Планировщик задач (Celery Beat) ===
@@ -47,6 +46,8 @@ services:
     command: celery -A tasks beat --loglevel=info
     environment:
       - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./parser/search_profiles.json:/app/search_profiles.json:ro
     restart: unless-stopped
 
   # === Микросервис ИИ-Агент ===
@@ -56,13 +57,13 @@ services:
     depends_on: [db, redis]
     environment:
       - DB_HOST=db
-      - DB_USER=tender_user
-      - DB_PASS=tender_password
-      - DB_NAME=tender_bot_db
+      - DB_USER=${DB_USER:-tender_user}
+      - DB_PASS=${DB_PASS:-tender_password}
+      - DB_NAME=${DB_NAME:-tender_bot_db}
       - REDIS_URL=redis://redis:6379/0
       - MISTRAL_API_KEY=${MISTRAL_API_KEY}
     volumes:
-      - ./data:/app/data
+      - ./data/tenders:/data/tenders
     restart: unless-stopped
 
   # === Микросервис Telegram Бот ===
@@ -72,13 +73,15 @@ services:
     depends_on: [db, redis]
     environment:
       - DB_HOST=db
-      - DB_USER=tender_user
-      - DB_PASS=tender_password
-      - DB_NAME=tender_bot_db
+      - DB_USER=${DB_USER:-tender_user}
+      - DB_PASS=${DB_PASS:-tender_password}
+      - DB_NAME=${DB_NAME:-tender_bot_db}
       - REDIS_URL=redis://redis:6379/0
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_PROXY_URL=${TELEGRAM_PROXY_URL}
       - ADMIN_TG_ID=${ADMIN_TG_ID}
+    volumes:
+      - ./data/tenders:/data/tenders:ro
     restart: unless-stopped
 
 volumes:

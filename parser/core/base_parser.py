@@ -21,7 +21,7 @@ class TenderCard(BaseModel):
     law_type: str = Field(description="44-ФЗ или 223-ФЗ")
     method: str = Field(description="Способ определения поставщика")
     price: float = Field(description="НМЦК")
-    deadline: datetime = Field(description="Дата и время окончания подачи заявок")
+    deadline: Optional[datetime] = Field(default=None, description="Дата и время окончания подачи заявок")
 
     # Исправленные поля: явно указываем default=None
     results_date: Optional[datetime] = Field(default=None, description="Дата подведения итогов")

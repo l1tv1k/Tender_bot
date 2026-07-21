@@ -1,5 +1,4 @@
 playwright==1.42.0
-camoufox[geoip]==0.3.0
 celery[redis]==5.3.6
 pydantic==2.6.4
 aiofiles==23.2.1

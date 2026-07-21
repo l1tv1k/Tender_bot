@@ -5,8 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 1. Сначала обновляем индексы и ставим необходимые для Firefox системные библиотеки
-# Это действие отделено от установки Playwright, чтобы повысить надежность
+# 1. Системные библиотеки для Chromium Playwright.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     libnss3 \
@@ -21,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libasound2 \
     libgbm1 \
+    chromium \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,13 +28,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Скачиваем сам браузер (без --with-deps, так как мы всё уже поставили выше)
-RUN playwright install firefox
+# 3. Используем Chromium из Debian, без скачивания браузера и FFMPEG
+# с нестабильного CDN Playwright.
+ENV CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # 4. Копируем код
 COPY . .
 
 # 5. Создаем директорию для маппинга
 RUN mkdir -p /app/data/tenders/eis
+
 
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info"]
