@@ -1,5 +1,9 @@
 .env
-docs/
+data/tenders/
 *.log
 *.xlsx
 *.docx
+/cloudeflare_proxy/
+.venv/
+__pycache__/
+*.pyc

@@ -7,7 +7,6 @@ import logging
 import os
 from uuid import uuid4
 
-import asyncpg
 import redis.asyncio as aioredis
 try:
     from celery import Celery
@@ -21,11 +20,19 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import BufferedInputFile, FSInputFile
 from aiogram.exceptions import TelegramNetworkError
 
-from config import BOT_TOKEN, PROXY_URL, ADMIN_TG_ID, DB_CONFIG, REDIS_URL
+from config import (
+    ADMIN_TG_ID,
+    BOT_TOKEN,
+    PROXY_URL,
+    REDIS_URL,
+    TELEGRAM_API_TIMEOUT,
+    TELEGRAM_POLLING_TIMEOUT,
+)
+from database import close_db_pool, db_connection, init_db_pool
+from telegram_ops import answer_callback, edit_message
 from views import (
     PAGE_SIZE,
     STATUS_CODES,
-    STATUS_MAP,
     format_full_card,
     format_tender_list,
     get_docs_keyboard,
@@ -43,7 +50,11 @@ parser_client = Celery("tender_bot_control", broker=REDIS_URL) if Celery else No
 
 
 def create_bot(proxy_url: str = "") -> Bot:
-    session = AiohttpSession(api=TelegramAPIServer.from_base(proxy_url)) if proxy_url else AiohttpSession()
+    session = (
+        AiohttpSession(api=TelegramAPIServer.from_base(proxy_url), timeout=TELEGRAM_API_TIMEOUT)
+        if proxy_url
+        else AiohttpSession(timeout=TELEGRAM_API_TIMEOUT)
+    )
     return Bot(token=BOT_TOKEN, session=session)
 
 
@@ -57,7 +68,7 @@ async def connect_telegram() -> Bot:
         label, proxy_url = candidates[attempt % len(candidates)]
         candidate = create_bot(proxy_url)
         try:
-            await candidate.delete_webhook(drop_pending_updates=True)
+            await candidate.delete_webhook(drop_pending_updates=False)
             logging.info("Telegram подключён %s", label)
             return candidate
         except TelegramNetworkError as error:
@@ -69,8 +80,7 @@ async def connect_telegram() -> Bot:
 
 
 async def ensure_schema():
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN DEFAULT TRUE")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_hour INT DEFAULT 9")
         await conn.execute("ALTER TABLE notification_log ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(255)")
@@ -80,10 +90,6 @@ async def ensure_schema():
             ON notification_log(user_id, tender_id, type, dedupe_key)
             """
         )
-    finally:
-        await conn.close()
-
-
 async def get_or_create_admin_user(conn, telegram_id: int):
     if telegram_id == ADMIN_TG_ID:
         return await conn.fetchrow(
@@ -103,11 +109,8 @@ async def get_or_create_admin_user(conn, telegram_id: int):
 
 
 async def require_user(telegram_id: int):
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         return await get_or_create_admin_user(conn, telegram_id)
-    finally:
-        await conn.close()
 
 
 async def enqueue_parser_run(debug: bool) -> str:
@@ -180,8 +183,7 @@ def build_celery_message(task_name: str, task_kwargs: dict) -> tuple[str, str]:
 
 async def fetch_tenders_page(user_id: int, page: int):
     offset = max(page, 0) * PAGE_SIZE
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM tenders")
         rows = await conn.fetch(
             """
@@ -205,13 +207,10 @@ async def fetch_tenders_page(user_id: int, page: int):
         )
         has_next = len(rows) > PAGE_SIZE
         return rows[:PAGE_SIZE], page, total, has_next
-    finally:
-        await conn.close()
 
 
 async def fetch_card(user_id: int, reestr_number: str):
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         row = await conn.fetchrow(
             """
             SELECT
@@ -244,8 +243,6 @@ async def fetch_card(user_id: int, reestr_number: str):
             return None, 0
         docs_count = await conn.fetchval("SELECT COUNT(*) FROM tender_documents WHERE tender_id = $1", row["id"])
         return row, docs_count
-    finally:
-        await conn.close()
 
 
 async def send_tenders_page(target, user_id: int, page: int, edit: bool = False):
@@ -253,9 +250,39 @@ async def send_tenders_page(target, user_id: int, page: int, edit: bool = False)
     text = format_tender_list(rows, page, total)
     keyboard = get_list_keyboard(rows, page, has_next) if rows else None
     if edit:
-        await target.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        await edit_message(target, text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     else:
         await target.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+async def render_callback_error(callback: types.CallbackQuery, text: str) -> None:
+    """Leaves a visible result after an already-acknowledged callback fails."""
+    if callback.message is None:
+        return
+    try:
+        await edit_message(callback.message, f"⚠️ {text}", disable_web_page_preview=True)
+    except Exception:
+        logging.exception("Не удалось показать пользователю ошибку callback")
+
+
+async def authorize_callback(callback: types.CallbackQuery, *, admin_only: bool = False):
+    try:
+        user = await require_user(callback.from_user.id)
+    except Exception:
+        logging.exception("Ошибка проверки доступа пользователя %s", callback.from_user.id)
+        await answer_callback(callback)
+        await render_callback_error(callback, "Сервис базы данных временно недоступен. Попробуйте ещё раз.")
+        return None
+
+    if not user:
+        await answer_callback(callback, "Нет доступа", show_alert=True)
+        return None
+    if admin_only and user["role"] != "admin":
+        await answer_callback(callback, "Запуск доступен только администратору", show_alert=True)
+        return None
+
+    await answer_callback(callback)
+    return user
 
 
 def resolve_document_path(file_path: str) -> str:
@@ -326,17 +353,16 @@ async def cmd_search(message: types.Message):
 
 @dp.callback_query(F.data.startswith("parser:"))
 async def parser_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if user["role"] != "admin":
-        await callback.answer("Запуск доступен только администратору", show_alert=True)
+    user = await authorize_callback(callback, admin_only=True)
+    if user is None:
         return
 
     debug = callback.data == "parser:debug"
-    await callback.answer("Задача запущена")
-    await run_parser_from_message(callback.message, user, debug=debug)
+    try:
+        await run_parser_from_message(callback.message, user, debug=debug)
+    except Exception:
+        logging.exception("Не удалось запустить задачу парсера из callback")
+        await render_callback_error(callback, "Не удалось поставить поиск в очередь. Попробуйте ещё раз.")
 
 
 @dp.message(Command("tenders"))
@@ -350,173 +376,177 @@ async def cmd_tenders(message: types.Message):
 
 @dp.callback_query(F.data.startswith("list:"))
 async def list_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
     page = int(callback.data.split(":")[1])
-    await send_tenders_page(callback.message, user["id"], page, edit=True)
-    await callback.answer()
+    try:
+        await send_tenders_page(callback.message, user["id"], page, edit=True)
+    except Exception:
+        logging.exception("Не удалось открыть страницу тендеров")
+        await render_callback_error(callback, "Не удалось загрузить список тендеров. Попробуйте ещё раз.")
 
 
 @dp.callback_query(F.data.startswith("card:"))
 async def card_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
 
     reestr_number = callback.data.split(":", 1)[1]
-    row, docs_count = await fetch_card(user["id"], reestr_number)
-    if not row:
-        await callback.answer("Тендер не найден", show_alert=True)
-        return
+    try:
+        row, docs_count = await fetch_card(user["id"], reestr_number)
+        if not row:
+            await render_callback_error(callback, "Тендер больше не найден в базе данных.")
+            return
 
-    await callback.message.edit_text(
-        format_full_card(row, docs_count),
-        reply_markup=get_status_keyboard(reestr_number),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    await callback.answer()
+        await edit_message(
+            callback.message,
+            format_full_card(row, docs_count),
+            reply_markup=get_status_keyboard(reestr_number),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.exception("Не удалось открыть карточку тендера %s", reestr_number)
+        await render_callback_error(callback, "Не удалось загрузить карточку тендера. Попробуйте ещё раз.")
 
 
 @dp.callback_query(F.data.startswith("status:"))
 async def process_status_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
 
     _, status_key, reestr_number = callback.data.split(":")
     status_code = STATUS_CODES[status_key]
-    new_status_label = STATUS_MAP[status_key]
-
-    conn = await asyncpg.connect(**DB_CONFIG)
     try:
-        tender = await conn.fetchrow("SELECT id FROM tenders WHERE reestr_number = $1", reestr_number)
-        if not tender:
-            await callback.answer("Тендер не найден в БД", show_alert=True)
-            return
+        async with db_connection() as conn:
+            tender = await conn.fetchrow("SELECT id FROM tenders WHERE reestr_number = $1", reestr_number)
+            if not tender:
+                await render_callback_error(callback, "Тендер больше не найден в базе данных.")
+                return
 
-        await conn.execute(
-            """
-            INSERT INTO user_tender_status (user_id, tender_id, status_code, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (user_id, tender_id) DO UPDATE SET
-                status_code = EXCLUDED.status_code,
-                updated_at = NOW()
-            """,
-            user["id"],
-            tender["id"],
-            status_code,
+            await conn.execute(
+                """
+                INSERT INTO user_tender_status (user_id, tender_id, status_code, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_id, tender_id) DO UPDATE SET
+                    status_code = EXCLUDED.status_code,
+                    updated_at = NOW()
+                """,
+                user["id"],
+                tender["id"],
+                status_code,
+            )
+
+        row, docs_count = await fetch_card(user["id"], reestr_number)
+        await edit_message(
+            callback.message,
+            format_full_card(row, docs_count),
+            reply_markup=get_status_keyboard(reestr_number),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    finally:
-        await conn.close()
-
-    row, docs_count = await fetch_card(user["id"], reestr_number)
-    await callback.message.edit_text(
-        format_full_card(row, docs_count),
-        reply_markup=get_status_keyboard(reestr_number),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    await callback.answer(f"Статус изменён на: {new_status_label}")
+    except Exception:
+        logging.exception("Не удалось сохранить статус тендера %s", reestr_number)
+        await render_callback_error(callback, "Не удалось сохранить статус. Попробуйте ещё раз.")
 
 
 @dp.callback_query(F.data.startswith("docs:"))
 async def docs_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
 
     reestr_number = callback.data.split(":", 1)[1]
-    conn = await asyncpg.connect(**DB_CONFIG)
     try:
-        rows = await conn.fetch(
-            """
-            SELECT td.id::text AS id, td.file_name, td.file_path
-            FROM tender_documents td
-            JOIN tenders t ON t.id = td.tender_id
-            WHERE t.reestr_number = $1
-            ORDER BY td.version DESC, td.downloaded_at DESC
-            """,
-            reestr_number,
+        async with db_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT td.id::text AS id, td.file_name, td.file_path
+                FROM tender_documents td
+                JOIN tenders t ON t.id = td.tender_id
+                WHERE t.reestr_number = $1
+                ORDER BY td.version DESC, td.downloaded_at DESC
+                """,
+                reestr_number,
+            )
+
+        if not rows:
+            await render_callback_error(callback, "Документы для этого тендера не найдены.")
+            return
+
+        await edit_message(
+            callback.message,
+            "📁 Документы тендера:",
+            reply_markup=get_docs_keyboard(rows, reestr_number),
+            parse_mode=ParseMode.HTML,
         )
-    finally:
-        await conn.close()
-
-    if not rows:
-        await callback.answer("Документы не найдены", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "📁 Документы тендера:",
-        reply_markup=get_docs_keyboard(rows, reestr_number),
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
+    except Exception:
+        logging.exception("Не удалось открыть документы тендера %s", reestr_number)
+        await render_callback_error(callback, "Не удалось загрузить документы. Попробуйте ещё раз.")
 
 
 @dp.callback_query(F.data.startswith("senddoc:"))
 async def send_document_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
 
     _, document_id = callback.data.split(":", 1)
-    conn = await asyncpg.connect(**DB_CONFIG)
     try:
-        row = await conn.fetchrow("SELECT file_name, file_path FROM tender_documents WHERE id = $1::uuid", document_id)
-    finally:
-        await conn.close()
+        async with db_connection() as conn:
+            row = await conn.fetchrow("SELECT file_name, file_path FROM tender_documents WHERE id = $1::uuid", document_id)
 
-    if not row:
-        await callback.answer("Документ не найден", show_alert=True)
-        return
+        if not row:
+            await render_callback_error(callback, "Документ больше не найден в базе данных.")
+            return
 
-    path = resolve_document_path(row["file_path"])
-    if not os.path.exists(path):
-        await callback.answer("Файл не найден на диске", show_alert=True)
-        return
+        path = resolve_document_path(row["file_path"])
+        if not os.path.exists(path):
+            await render_callback_error(callback, "Файл документа отсутствует на диске.")
+            return
 
-    if os.path.getsize(path) > 49 * 1024 * 1024:
-        await callback.answer("Файл больше лимита Telegram 50 МБ", show_alert=True)
-        return
+        if os.path.getsize(path) > 49 * 1024 * 1024:
+            await render_callback_error(callback, "Файл больше лимита Telegram 50 МБ.")
+            return
 
-    await callback.message.answer_document(FSInputFile(path, filename=row["file_name"]))
-    await callback.answer("Отправляю документ")
+        # sendDocument is intentionally not retried: a timed-out response can still mean a delivered file.
+        await callback.message.answer_document(FSInputFile(path, filename=row["file_name"]))
+    except Exception:
+        logging.exception("Не удалось отправить документ %s", document_id)
+        await render_callback_error(callback, "Не удалось отправить документ. Попробуйте ещё раз.")
 
 
 @dp.callback_query(F.data.startswith("reanalyze:"))
 async def reanalyze_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
 
     reestr_number = callback.data.split(":", 1)[1]
-    conn = await asyncpg.connect(**DB_CONFIG)
     try:
-        tender_id = await conn.fetchval("SELECT id::text FROM tenders WHERE reestr_number = $1", reestr_number)
-    finally:
-        await conn.close()
+        async with db_connection() as conn:
+            tender_id = await conn.fetchval("SELECT id::text FROM tenders WHERE reestr_number = $1", reestr_number)
 
-    if not tender_id:
-        await callback.answer("Тендер не найден", show_alert=True)
-        return
+        if not tender_id:
+            await render_callback_error(callback, "Тендер больше не найден в базе данных.")
+            return
 
-    redis = aioredis.from_url(REDIS_URL)
-    await redis.lpush("analysis_tenders", tender_id)
-    await redis.close()
-    await callback.answer("Поставил тендер на повторный анализ")
+        redis = aioredis.from_url(REDIS_URL)
+        try:
+            await redis.lpush("analysis_tenders", tender_id)
+        finally:
+            await redis.close()
+        await edit_message(callback.message, "🧠 Повторный анализ поставлен в очередь.")
+    except Exception:
+        logging.exception("Не удалось поставить тендер %s на повторный анализ", reestr_number)
+        await render_callback_error(callback, "Не удалось поставить повторный анализ в очередь. Попробуйте ещё раз.")
 
 
 async def export_csv(message_or_callback, user_id: int):
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         rows = await conn.fetch(
             """
             SELECT
@@ -537,8 +567,6 @@ async def export_csv(message_or_callback, user_id: int):
             """,
             user_id,
         )
-    finally:
-        await conn.close()
 
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=";")
@@ -573,12 +601,15 @@ async def cmd_export(message: types.Message):
 
 @dp.callback_query(F.data == "export:csv")
 async def export_callback(callback: types.CallbackQuery):
-    user = await require_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Нет доступа", show_alert=True)
+    user = await authorize_callback(callback)
+    if user is None:
         return
-    await export_csv(callback, user["id"])
-    await callback.answer("Готовлю CSV")
+    try:
+        # CSV is sent once without automatic retry for the same reason as tender documents.
+        await export_csv(callback, user["id"])
+    except Exception:
+        logging.exception("Не удалось сформировать CSV-выгрузку")
+        await render_callback_error(callback, "Не удалось подготовить CSV. Попробуйте ещё раз.")
 
 
 @dp.message(Command("digest"))
@@ -588,8 +619,7 @@ async def cmd_digest(message: types.Message):
         await message.answer("⛔ У вас нет доступа к этому боту.")
         return
 
-    conn = await asyncpg.connect(**DB_CONFIG)
-    try:
+    async with db_connection() as conn:
         new_count = await conn.fetchval("SELECT COUNT(*) FROM tenders WHERE first_seen_at >= NOW() - INTERVAL '1 day'")
         hot_count = await conn.fetchval(
             """
@@ -601,8 +631,6 @@ async def cmd_digest(message: types.Message):
             """,
             user["id"],
         )
-    finally:
-        await conn.close()
 
     await message.answer(
         f"📬 Дайджест за сутки\n\n"
@@ -617,6 +645,7 @@ async def main():
         logging.error("TELEGRAM_BOT_TOKEN не задан!")
         return
 
+    await init_db_pool()
     bot = await connect_telegram()
     await ensure_schema()
     logging.info("Запуск бота: транспорт Telegram выбран по результату подключения")
@@ -625,9 +654,10 @@ async def main():
     asyncio.create_task(scheduled_notifications_task(bot))
 
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, polling_timeout=TELEGRAM_POLLING_TIMEOUT)
     finally:
         await bot.session.close()
+        await close_db_pool()
 
 
 if __name__ == "__main__":
