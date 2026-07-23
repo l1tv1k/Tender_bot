@@ -26,9 +26,17 @@ from config import (
     PROXY_URL,
     REDIS_URL,
     TELEGRAM_API_TIMEOUT,
+    TELEGRAM_DOCUMENT_TIMEOUT,
+    TELEGRAM_DOCUMENT_TRANSPORT,
     TELEGRAM_POLLING_TIMEOUT,
+    MTPROTO_CONNECT_TIMEOUT,
 )
 from database import close_db_pool, db_connection, init_db_pool
+from mtproto_uploader import (
+    close_mtproto_uploader,
+    connect_mtproto_uploader,
+    send_mtproto_file,
+)
 from telegram_ops import answer_callback, edit_message
 from views import (
     PAGE_SIZE,
@@ -47,6 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 bot: Bot | None = None
 dp = Dispatcher()
 parser_client = Celery("tender_bot_control", broker=REDIS_URL) if Celery else None
+mtproto_uploader_ready = False
 
 
 def create_bot(proxy_url: str = "") -> Bot:
@@ -100,8 +109,7 @@ async def get_or_create_admin_user(conn, telegram_id: int):
             RETURNING id, telegram_id, role
             """,
             telegram_id,
-        )
-
+)
     return await conn.fetchrow(
         "SELECT id, telegram_id, role FROM users WHERE telegram_id = $1",
         telegram_id,
@@ -263,6 +271,44 @@ async def render_callback_error(callback: types.CallbackQuery, text: str) -> Non
         await edit_message(callback.message, f"⚠️ {text}", disable_web_page_preview=True)
     except Exception:
         logging.exception("Не удалось показать пользователю ошибку callback")
+
+
+async def send_file_to_user(message: types.Message, document) -> None:
+    """Sends a file once through the configured transport."""
+    if TELEGRAM_DOCUMENT_TRANSPORT == "mtproto" and mtproto_uploader_ready:
+        logging.info("Отправка файла в Telegram через MTProto")
+        if isinstance(document, FSInputFile):
+            await send_mtproto_file(message.chat.id, str(document.path), document.filename)
+            return
+        if isinstance(document, BufferedInputFile):
+            payload = io.BytesIO(document.data)
+            payload.name = document.filename
+            await send_mtproto_file(message.chat.id, payload, document.filename)
+            return
+        raise RuntimeError(f"Неподдерживаемый тип файла для MTProto: {type(document).__name__}")
+
+    if TELEGRAM_DOCUMENT_TRANSPORT == "mtproto":
+        logging.warning("MTProto недоступен, отправляем файл через Worker")
+
+    if TELEGRAM_DOCUMENT_TRANSPORT != "direct":
+        logging.info("Отправка файла в Telegram через Worker")
+        await message.answer_document(document, request_timeout=TELEGRAM_DOCUMENT_TIMEOUT)
+        return
+
+    logging.info("Отправка файла в Telegram напрямую")
+    direct_bot = create_bot()
+    try:
+        await direct_bot.send_document(
+            chat_id=message.chat.id,
+            document=document,
+            request_timeout=TELEGRAM_DOCUMENT_TIMEOUT,
+        )
+    finally:
+        await direct_bot.session.close()
+
+
+async def send_document_to_user(message: types.Message, path: str, filename: str) -> None:
+    await send_file_to_user(message, FSInputFile(path, filename=filename))
 
 
 async def authorize_callback(callback: types.CallbackQuery, *, admin_only: bool = False):
@@ -513,7 +559,7 @@ async def send_document_callback(callback: types.CallbackQuery):
             return
 
         # sendDocument is intentionally not retried: a timed-out response can still mean a delivered file.
-        await callback.message.answer_document(FSInputFile(path, filename=row["file_name"]))
+        await send_document_to_user(callback.message, path, row["file_name"])
     except Exception:
         logging.exception("Не удалось отправить документ %s", document_id)
         await render_callback_error(callback, "Не удалось отправить документ. Попробуйте ещё раз.")
@@ -587,7 +633,7 @@ async def export_csv(message_or_callback, user_id: int):
     content = buffer.getvalue().encode("utf-8-sig")
     file = BufferedInputFile(content, filename="tenders.csv")
     target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
-    await target.answer_document(file)
+    await send_file_to_user(target, file)
 
 
 @dp.message(Command("export"))
@@ -640,6 +686,8 @@ async def cmd_digest(message: types.Message):
 
 
 async def main():
+    global mtproto_uploader_ready
+
     global bot
     if not BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN не задан!")
@@ -649,6 +697,15 @@ async def main():
     bot = await connect_telegram()
     await ensure_schema()
     logging.info("Запуск бота: транспорт Telegram выбран по результату подключения")
+    if TELEGRAM_DOCUMENT_TRANSPORT == "mtproto":
+        logging.info("Загрузчик документов настроен на MTProto")
+        try:
+            await asyncio.wait_for(connect_mtproto_uploader(), timeout=MTPROTO_CONNECT_TIMEOUT)
+            mtproto_uploader_ready = True
+            logging.info("MTProto-загрузчик успешно авторизован")
+        except Exception as error:
+            logging.warning("MTProto-загрузчик недоступен, включён fallback Worker: %s", error)
+            await close_mtproto_uploader()
 
     asyncio.create_task(redis_listener_task(bot))
     asyncio.create_task(scheduled_notifications_task(bot))
@@ -657,6 +714,7 @@ async def main():
         await dp.start_polling(bot, polling_timeout=TELEGRAM_POLLING_TIMEOUT)
     finally:
         await bot.session.close()
+        await close_mtproto_uploader()
         await close_db_pool()
 
 
